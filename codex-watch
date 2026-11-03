@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# codex-watch: live, readable view of Codex jobs started with `codex exec --json`.
+#
+# Usage:
+#   codex-watch                  follow the newest log matching CODEX_WATCH_GLOB
+#   codex-watch <file>           follow one job's .jsonl log
+#   codex-watch -                read events from stdin (codex exec --json ... | codex-watch -)
+#   codex-watch --once [file]    print a job once and exit
+#   codex-watch --help
+#
+# CODEX_WATCH_GLOB: where to look for logs (space separated globs).
+# Default matches Claude Code scratchpads: /tmp/claude-<uid>/*/*/scratchpad/codex-*.jsonl
+set -u
+
+VERSION="0.1.0"
+glob="${CODEX_WATCH_GLOB:-/tmp/claude-$(id -u)/*/*/scratchpad/codex-*.jsonl}"
+interval="${CODEX_WATCH_INTERVAL:-3}"
+
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+newest() {
+  # shellcheck disable=SC2086
+  ls -t $glob 2>/dev/null | head -1
+}
+
+render() {
+  jq -rR --unbuffered '
+    def first_line: split("\n")[0] | .[0:180];
+    def cmd: sub("^/bin/(zsh|bash|sh) -lc "; "") | sub("^[\"'\'']"; "") | sub("[\"'\'']$"; "");
+    fromjson? |
+    if .type == "thread.started" then "\n\u001b[36m● Codex chat \(.thread_id)\u001b[0m"
+    elif .type == "turn.started" then "\u001b[36m● working\u001b[0m"
+    elif .type == "item.started" and .item.type == "command_execution" then
+      "\u001b[2m▶ \(.item.command | cmd | first_line)\u001b[0m"
+    elif .type == "item.completed" and .item.type == "command_execution" then
+      if (.item.exit_code // 0) == 0 then empty
+      else "\u001b[31m  ✗ exit \(.item.exit_code)\u001b[0m\n" +
+           ((.item.aggregated_output // "") | split("\n") | .[-6:] | map("    " + .) | join("\n"))
+      end
+    elif .type == "item.completed" and .item.type == "file_change" then
+      ((.item.changes // []) | map("\u001b[33m  ✎ \(.kind // "edit") \(.path)\u001b[0m") | join("\n"))
+    elif .type == "item.completed" and .item.type == "agent_message" then
+      "\n\u001b[1m\(.item.text)\u001b[0m\n"
+    elif .type == "turn.completed" then "\u001b[32m● done\u001b[0m"
+    elif .type == "turn.failed" or .type == "error" then
+      "\u001b[31m● failed: \(.error.message // .message // "unknown")\u001b[0m"
+    else empty end'
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "codex-watch needs jq: https://jqlang.org/download/" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  -v|--version)
+    echo "codex-watch $VERSION"
+    exit 0
+    ;;
+  --once)
+    file="${2:-$(newest)}"
+    if [ -z "$file" ]; then
+      echo "No Codex log found matching: $glob" >&2
+      exit 1
+    fi
+    render < "$file"
+    exit
+    ;;
+  -)
+    render
+    exit
+    ;;
+  "")
+    ;;
+  *)
+    tail -n +1 -F "$1" | render
+    exit
+    ;;
+esac
+
+stop_tail() {
+  if [ -n "$tail_pid" ]; then
+    pkill -P "$tail_pid" 2>/dev/null
+    kill "$tail_pid" 2>/dev/null
+  fi
+}
+
+# Follow the newest job, switching when a newer one starts.
+current=""
+tail_pid=""
+trap 'stop_tail; exit' INT TERM
+while true; do
+  latest=$(newest)
+  if [ -n "$latest" ] && [ "$latest" != "$current" ]; then
+    stop_tail
+    current=$latest
+    printf '\n\033[36m━━ %s\033[0m\n' "$(basename "$current")"
+    (tail -n +1 -F "$current" 2>/dev/null | render) &
+    tail_pid=$!
+  elif [ -z "$latest" ] && [ -z "$current" ]; then
+    printf '\rWaiting for a Codex job...'
+  fi
+  sleep "$interval"
+done
